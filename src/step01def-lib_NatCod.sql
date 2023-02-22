@@ -36,10 +36,18 @@ CREATE or replace FUNCTION hex_to_varbit(h text) RETURNS varbit as $f$
  SELECT ('X' || $1)::varbit
 $f$ LANGUAGE SQL IMMUTABLE;
 
+
 CREATE or replace FUNCTION varbit_to_int( b varbit, blen int DEFAULT NULL) RETURNS int AS $f$
-  SELECT (  (b'0'::bit(32) || b) << COALESCE(blen,bit_length(b))   )::bit(32)::int
+  -- slower  SELECT (  (b'0'::bit(32) || b) << COALESCE(blen,length(b))   )::bit(32)::int
+  SELECT overlay( b'0'::bit(32) PLACING b FROM 33-COALESCE(blen,length(b)) )::int
 $f$ LANGUAGE SQL IMMUTABLE;
 -- select b'010101'::bit(32) left_copy, varbit_to_int(b'010101')::bit(32) right_copy;
+
+CREATE or replace FUNCTION varbit_to_bigint( b varbit, blen int DEFAULT NULL) RETURNS bigint AS $f$
+  SELECT overlay( b'0'::bit(64) PLACING b FROM 65-COALESCE(blen,length(b)) )::bigint
+  -- litle bit less faster, SELECT ( (b'0'::bit(64) || b) << bit_length(b) )::bit(64)::bigint
+$f$ LANGUAGE SQL IMMUTABLE;
+-- select b'010101'::bit(64) left_copy, varbit_to_bigint(b'010101')::bit(64) right_copy;
 
 
 -- -- CONVERT:
@@ -53,11 +61,12 @@ COMMENT ON FUNCTION natcod.hbig_to_vbit
 ;
 
 CREATE FUNCTION natcod.vbit_to_hbig(x varbit) RETURNS bigint as $f$  -- hb_encode
-  SELECT overlay( 0::bigint::bit(64) PLACING ('b1' || x) FROM 64-length(x) )::bigint
+  SELECT overlay( b'0'::bit(64) PLACING (b'1' || x) FROM 64-length(x) )::bigint
 $f$ LANGUAGE SQL IMMUTABLE;
-COMMENT ON FUNCTION natcod.vbit_to_hbig
+COMMENT ON FUNCTION natcod.vbit_to_hbig(varbit)
   IS 'Converts varbit into a Bigint representing hidden-bit (hb) Natural Code.'
 ;
+
 
 CREATE FUNCTION natcod.strbit_to_vbit(b text, p_len int DEFAULT null) RETURNS varbit AS $f$
    SELECT CASE WHEN p_len>0 THEN  lpad(b, p_len, '0')::varbit ELSE  b::varbit  END
@@ -91,6 +100,11 @@ BEGIN
 END;
 $f$ LANGUAGE PLpgSQL IMMUTABLE;
 
+CREATE FUNCTION natcod.generate_vbit_series(bit_len int) RETURNS setof varbit as $f$
+  SELECT natcod.hbig_to_vbit(hb)
+  FROM natcod.generate_hb_series($1) t(hb) ORDER BY 1
+$f$ LANGUAGE SQL IMMUTABLE;
+
 
 ------
 ------ BASE CONVERT
@@ -109,20 +123,20 @@ DECLARE
     bits_per_digit int;
     tr int[] := '{ {1,2,0,0}, {1,3,4,0}, {1,3,5,6} }'::int[]; -- --4h(bits,pos), 8h(bits,pos)
     tr_selected JSONb;
-    trtypes JSONb := '{"2":[1,1], "4":[1,2], "8":[2,3], "16":[3,4]}'::JSONb; -- TrPos,bits
+    trtypes JSONb := '{"2":[1,1], "4":[1,2], "8":[2,3], "16":[3,4]}'::JSONb; -- TrPos,bits. Can be array.
     trpos int;
-    baseh "char"[] := array[
-      '[0:15]={G,H,x,x,x,x,x,x,x,x,x,x,x,x,x,x}'::"char"[], --1. 4h,8h,16h 1bit
-      '[0:15]={0,1,2,3,x,x,x,x,x,x,x,x,x,x,x,x}'::"char"[], --2. 4h 2bit
-      '[0:15]={J,K,L,M,x,x,x,x,x,x,x,x,x,x,x,x}'::"char"[], --3. 8h,16h 2bit
-      '[0:15]={0,1,2,3,4,5,6,7,x,x,x,x,x,x,x,x}'::"char"[], --4. 8h 3bit
-      '[0:15]={N,P,Q,R,S,T,V,Z,x,x,x,x,x,x,x,x}'::"char"[], --5. 16h 3bit
-      '[0:15]={0,1,2,3,4,5,6,7,8,9,a,b,c,d,e,f}'::"char"[]  --6. 16h 4bit
-    ]; -- jumpping I,O and U,W,X letters!
+    baseh "char"[] := array[ -- new 2023 standard for Baseh:
+      '[0:15]={G,Q,x,x,x,x,x,x,x,x,x,x,x,x,x,x}'::"char"[], --1. 1 bit in 4h,8h,16h
+      '[0:15]={0,1,2,3,x,x,x,x,x,x,x,x,x,x,x,x}'::"char"[], --2. 2 bits in 4h
+      '[0:15]={H,M,R,V,x,x,x,x,x,x,x,x,x,x,x,x}'::"char"[], --3. 2 bits 8h,16h
+      '[0:15]={0,1,2,3,4,5,6,7,x,x,x,x,x,x,x,x}'::"char"[], --4. 3 bits in 8h
+      '[0:15]={J,K,N,P,S,T,Z,Y,x,x,x,x,x,x,x,x}'::"char"[], --5. 3 bits in 16h
+      '[0:15]={0,1,2,3,4,5,6,7,8,9,a,b,c,d,e,f}'::"char"[]  --6. 4 bits in 16h
+    ]; -- jumpping I,O and L,U,W,X letters!
        -- the standard alphabet is https://tools.ietf.org/html/rfc4648#section-6
 BEGIN
   vlen := bit_length(p_val);
-  tr_selected := trtypes->(p_base::text);
+  tr_selected := trtypes->(p_base::text);  -- can be array instead of JSON
   IF p_val IS NULL OR tr_selected IS NULL OR vlen=0 THEN
     RETURN NULL; -- or  p_retnull;
   END IF;
@@ -329,6 +343,10 @@ $f$ LANGUAGE PLpgSQL IMMUTABLE;
 CREATE FUNCTION natcod.vbit_to_hbig(p text) RETURNS bigint AS $wrap$
   SELECT natcod.vbit_to_hbig(p::varbit)
 $wrap$ LANGUAGE SQL IMMUTABLE;
+COMMENT ON FUNCTION natcod.vbit_to_hbig(text)
+  IS 'A wrap for vbit_to_hbig(varbit).'
+;
+
 
 CREATE FUNCTION natcod.hbig_to_str(
   p_val bigint,  -- input
